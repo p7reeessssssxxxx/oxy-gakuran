@@ -297,8 +297,9 @@ connectWS = function()
             elseif msg.type == "targets" then
                 cfg._targets = msg.targets or {}                 -- fresh target list for a paid client
                 if cfg._onTargets then pcall(cfg._onTargets, cfg._targets) end
+            elseif msg.type == "ack" then
+                if cfg._onAck then pcall(cfg._onAck, msg) end     -- send result (ok / cooldown / error)
             end
-            -- msg.type == "ack": fire-and-forget send, nothing to do
         end)
     end
 
@@ -325,6 +326,7 @@ end
 cfg._targets = cfg._targets or {}
 
 function OxyNet.onTargets(cb) cfg._onTargets = cb end
+function OxyNet.onAck(cb) cfg._onAck = cb end
 function OxyNet.getTargets() return cfg._targets or {} end   -- cached; instant, no request
 
 -- ask for a fresh list. Over WS = non-blocking; HTTP fallback spawns off-thread.
@@ -345,22 +347,34 @@ function OxyNet.requestTargets()
 end
 
 -- send a command. Over WS = a fire-and-forget socket write (no HTTP, no FPS hit).
+-- Result (ok / cooldown / error) comes back through OxyNet.onAck.
 function OxyNet.sendCommand(targetUserId, action, args)
     if wsSock then
+        cfg._rid = (cfg._rid or 0) + 1
         pcall(function()
             wsSock:Send(HttpService:JSONEncode({
-                type = "cmd", targetUserId = tostring(targetUserId),
+                type = "cmd", rid = cfg._rid, targetUserId = tostring(targetUserId),
                 action = action, args = args or {}, fromName = LP.Name,
             }))
         end)
         return true
     end
     if not cfg.backendUrl then return false, "not started" end
-    local headers = { ["x-oxy-token"] = cfg.adminToken or "" }
-    return httpJson("POST", cfg.backendUrl .. "/api/command", headers, {
-        targetUserId = tostring(targetUserId), action = action, args = args or {},
-        fromUserId = tostring(LP.UserId), fromName = LP.Name,
-    })
+    task.spawn(function()   -- HTTP fallback (only if the executor lacks WebSocket)
+        local headers = { ["x-oxy-token"] = cfg.adminToken or "" }
+        local ok, res, text = httpJson("POST", cfg.backendUrl .. "/api/command", headers, {
+            targetUserId = tostring(targetUserId), action = action, args = args or {},
+            fromUserId = tostring(LP.UserId), fromName = LP.Name,
+        })
+        local ack = { action = action, ok = (ok == true) }
+        if not ok then
+            local okD, body = pcall(function() return HttpService:JSONDecode(text or "") end)
+            if okD and type(body) == "table" then ack.error = body.error; ack.retryMs = body.retryMs
+            else ack.error = tostring(res) end
+        end
+        if cfg._onAck then pcall(cfg._onAck, ack) end
+    end)
+    return true
 end
 
 OxyNet.ACTIONS = { "spin", "freeze", "unfreeze", "sit", "explode", "notify", "fakekick", "ping" }

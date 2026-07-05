@@ -64,6 +64,19 @@ const ACTIONS = new Set([
   "explode",   // visual explosion on the victim (no blast force)
 ]);
 
+// Per (sender + target + action) cooldown, in SECONDS. Enforced server-side (authoritative).
+const COOLDOWNS = {
+  fakekick: 3600,  // 1 hour
+  explode:  30,
+  freeze:   20,
+  spin:     15,
+  sit:      12,
+  notify:   10,
+  unfreeze: 5,
+  ping:     3,
+};
+const lastSent = new Map(); // "senderId|targetId|action" -> ts  (cooldown tracking)
+
 if (HUB_KEYS.size === 0) {
   console.warn("[oxy-relay] WARNING: no keys configured (HUB_KEYS / ADMIN_TOKEN) — paid endpoints are OPEN. Set HUB_KEYS.");
 }
@@ -90,6 +103,10 @@ function prune() {
   for (const [id, p] of presence) {
     if (!wsOpen(p) && t - p.lastSeen > PRESENCE_TTL_MS * 3) presence.delete(id);
   }
+  // drop cooldown entries older than the longest cooldown (1h) so the map stays small
+  for (const [k, ts] of lastSent) {
+    if (t - ts > 3600 * 1000 + 60000) lastSent.delete(k);
+  }
 }
 setInterval(prune, 5000).unref?.();
 
@@ -108,17 +125,25 @@ function sendExec(socket, cmd) {
 }
 // Validate + deliver a command. Returns { code, body } (same shape HTTP and WS use).
 function enqueueCommand({ targetUserId, action, args, from }) {
-  if (!ACTIONS.has(action)) return { code: 400, body: { ok: false, error: "unknown action" } };
+  if (!ACTIONS.has(action)) return { code: 400, body: { ok: false, error: "unknown action", action } };
+  const senderId = (from && (from.userId || from.hub)) || "?";
+  const cdMs = (COOLDOWNS[action] || 0) * 1000;
+  const cdKey = senderId + "|" + targetUserId + "|" + action;
+  if (cdMs > 0) {
+    const remain = cdMs - (now() - (lastSent.get(cdKey) || 0));
+    if (remain > 0) return { code: 429, body: { ok: false, error: "cooldown", action, retryMs: remain } };
+  }
   const target = presence.get(targetUserId);
-  if (!isOnline(target)) return { code: 404, body: { ok: false, error: "target offline" } };
-  if (target.tier === "paid") return { code: 403, body: { ok: false, error: "target is immune (paid)" } };
+  if (!isOnline(target)) return { code: 404, body: { ok: false, error: "target offline", action } };
+  if (target.tier === "paid") return { code: 403, body: { ok: false, error: "target is immune (paid)", action } };
+  if (cdMs > 0) lastSent.set(cdKey, now());   // consume cooldown only once the send is valid
   let cleanArgs = {};
   if (args && typeof args === "object") { try { if (JSON.stringify(args).length <= 4096) cleanArgs = args; } catch {} }
   const cmd = { id: ++cmdCounter + "-" + now(), action, args: cleanArgs, from, ts: now() };
-  if (wsOpen(target) && sendExec(target.ws, cmd)) return { code: 200, body: { ok: true, pushed: true, id: cmd.id } };
+  if (wsOpen(target) && sendExec(target.ws, cmd)) return { code: 200, body: { ok: true, pushed: true, id: cmd.id, action } };
   target.queue.push(cmd);
   if (target.queue.length > MAX_QUEUE) target.queue.splice(0, target.queue.length - MAX_QUEUE);
-  return { code: 200, body: { ok: true, queued: target.queue.length, id: cmd.id } };
+  return { code: 200, body: { ok: true, queued: target.queue.length, id: cmd.id, action } };
 }
 
 // ---------------------------------------------------------------------------
@@ -338,7 +363,7 @@ wss.on("connection", (socket) => {
         args: msg.args,
         from: { userId: socket.userId || "", name: cleanStr(msg.fromName, 32), hub: socket.adminHub || "?" },
       });
-      try { socket.send(JSON.stringify({ type: "ack", rid: msg.rid, ok: r.body.ok, error: r.body.error, id: r.body.id })); } catch {}
+      try { socket.send(JSON.stringify({ type: "ack", rid: msg.rid, ok: r.body.ok, error: r.body.error, retryMs: r.body.retryMs, action: r.body.action, id: r.body.id })); } catch {}
 
     } else if (msg.type === "targets") {
       if (socket.adminHub === undefined) return;
