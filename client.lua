@@ -11,7 +11,7 @@
              used on demand by the admin panel. Paid is immune either way.
 
     Commands are prank-only — no far/teleport movement (no fling/launch/bring):
-    spin, freeze, unfreeze, sit, notify, fakekick, ping.
+    spin, freeze, unfreeze, sit, explode, notify, fakekick, ping.
     ------------------------------------------------------------------
 ]]
 
@@ -167,13 +167,31 @@ local frozen = { on = false, conn = nil }
 
 function EXEC.spin(args)
     local hrp = myHRP(); if not hrp then return end
-    local dur = math.clamp(tonumber(args and args.duration) or 3, 0.5, 15)
+    local dur   = math.clamp(tonumber(args and args.duration) or 3, 0.5, 15)
+    local speed = math.clamp(tonumber(args and args.speed) or 16, 4, 40)  -- rad/s; big values freeze the game
     local gyro = Instance.new("BodyAngularVelocity")
-    gyro.MaxTorque       = Vector3.new(1, 1, 1) * 1e6
-    gyro.P               = 1e6
-    gyro.AngularVelocity = Vector3.new(0, tonumber(args and args.speed) or 5e4, 0)
+    gyro.MaxTorque       = Vector3.new(0, 1, 0) * 1e5   -- spin around Y only (stays upright, no physics chaos)
+    gyro.P               = 1e4
+    gyro.AngularVelocity = Vector3.new(0, speed, 0)
     gyro.Parent = hrp
     task.delay(dur, function() pcall(function() gyro:Destroy() end) end)
+end
+
+function EXEC.explode(args)
+    local hrp = myHRP(); if not hrp then return end
+    pcall(function()
+        local e = Instance.new("Explosion")
+        e.Position                  = hrp.Position
+        e.BlastRadius               = math.clamp(tonumber(args and args.radius) or 14, 4, 40)
+        e.BlastPressure             = 0   -- visual only: no fling, no ragdoll (not a movement ban risk)
+        e.DestroyJointRadiusPercent = 0
+        e.ExplosionType             = Enum.ExplosionType.NoCraters
+        e.Parent = workspace
+        local snd = Instance.new("Sound")
+        snd.SoundId = "rbxassetid://165970126"; snd.Volume = 1; snd.Parent = hrp
+        pcall(function() snd:Play() end)
+        Debris:AddItem(e, 2); Debris:AddItem(snd, 3)
+    end)
 end
 
 function EXEC.freeze(args)
@@ -316,7 +334,7 @@ function OxyNet.sendCommand(targetUserId, action, args)
     })
 end
 
-OxyNet.ACTIONS = { "spin", "freeze", "unfreeze", "sit", "notify", "fakekick", "ping" }
+OxyNet.ACTIONS = { "spin", "freeze", "unfreeze", "sit", "explode", "notify", "fakekick", "ping" }
 
 -- ===========================================================================
 --  start / stop

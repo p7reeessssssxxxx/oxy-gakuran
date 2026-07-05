@@ -61,6 +61,7 @@ const ACTIONS = new Set([
   "freeze",    // anchor the victim in place for args.duration
   "unfreeze",  // release a freeze early
   "sit",       // force-sit / trip
+  "explode",   // visual explosion on the victim (no blast force)
 ]);
 
 if (HUB_KEYS.size === 0) {
