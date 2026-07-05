@@ -11,6 +11,7 @@
 //   MAX_QUEUE      - max pending commands per target (default 20)
 
 import express from "express";
+import { WebSocketServer } from "ws";
 import { readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -76,14 +77,17 @@ let cmdCounter = 0;
 
 const now = () => Date.now();
 
+function wsOpen(p) {
+  return p && p.ws && p.ws.readyState === 1; // 1 === WebSocket.OPEN
+}
 function isOnline(p) {
-  return p && now() - p.lastSeen <= PRESENCE_TTL_MS;
+  return p && (wsOpen(p) || now() - p.lastSeen <= PRESENCE_TTL_MS);
 }
 
 function prune() {
   const t = now();
   for (const [id, p] of presence) {
-    if (t - p.lastSeen > PRESENCE_TTL_MS * 3) presence.delete(id);
+    if (!wsOpen(p) && t - p.lastSeen > PRESENCE_TTL_MS * 3) presence.delete(id);
   }
 }
 setInterval(prune, 5000).unref?.();
@@ -271,12 +275,70 @@ app.post("/api/command", (req, res) => {
     from: { userId: cleanStr(b.fromUserId, 24), name: cleanStr(b.fromName, 32), hub: senderHub || "?" },
     ts: now(),
   };
+  // If the target holds a live socket, push instantly (no polling delay). Else queue for its next poll.
+  if (wsOpen(target)) {
+    try { target.ws.send(JSON.stringify(cmd)); return res.json({ ok: true, pushed: true, id: cmd.id }); } catch {}
+  }
   target.queue.push(cmd);
   if (target.queue.length > MAX_QUEUE) target.queue.splice(0, target.queue.length - MAX_QUEUE);
-
   res.json({ ok: true, queued: target.queue.length, id: cmd.id });
 });
 
-app.listen(PORT, () => {
+const httpServer = app.listen(PORT, () => {
   console.log(`[oxy-relay] listening on :${PORT}  (ttl ${PRESENCE_TTL_MS}ms, ${HUB_KEYS.size} hub key(s): ${[...HUB_KEYS.values()].join(", ") || "OPEN"})`);
 });
+
+// ---------------------------------------------------------------------------
+// WebSocket: free clients connect once and receive commands PUSHED (no polling,
+// so the executor never has to make periodic HTTP calls that freeze the game).
+// ---------------------------------------------------------------------------
+const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
+
+wss.on("connection", (socket) => {
+  socket.isAlive = true;
+  socket.on("pong", () => { socket.isAlive = true; });
+
+  socket.on("message", (data) => {
+    let msg;
+    try { msg = JSON.parse(data.toString()); } catch { return; }
+
+    if (msg.type === "hello") {
+      const userId = cleanStr(msg.userId, 24);
+      if (!userId || userId === "0") return;
+      socket.userId = userId;
+      let p = presence.get(userId);
+      if (!p) { p = { userId, firstSeen: now(), queue: [] }; presence.set(userId, p); }
+      p.name        = cleanStr(msg.name, 32);
+      p.displayName = cleanStr(msg.displayName, 32);
+      p.placeId     = cleanStr(msg.placeId, 24);
+      p.jobId       = cleanStr(msg.jobId, 80);
+      p.tier        = msg.tier === "paid" ? "paid" : "free";
+      p.hubId       = cleanStr(msg.hubId, 24) || "unknown";
+      p.lastSeen    = now();
+      p.ws          = socket;
+      // flush anything that queued before the socket was up (free only)
+      if (p.tier !== "paid" && p.queue.length) {
+        for (const c of p.queue) { try { socket.send(JSON.stringify(c)); } catch {} }
+        p.queue = [];
+      }
+    } else if (msg.type === "hb") {
+      const p = socket.userId && presence.get(socket.userId);
+      if (p) p.lastSeen = now();
+    }
+  });
+
+  socket.on("close", () => {
+    const p = socket.userId && presence.get(socket.userId);
+    if (p && p.ws === socket) { p.ws = null; p.lastSeen = now(); }
+  });
+  socket.on("error", () => {});
+});
+
+// drop dead sockets (ping/pong keepalive every 30s)
+setInterval(() => {
+  for (const socket of wss.clients) {
+    if (socket.isAlive === false) { try { socket.terminate(); } catch {} continue; }
+    socket.isAlive = false;
+    try { socket.ping(); } catch {}
+  }
+}, 30000).unref?.();

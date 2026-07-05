@@ -218,9 +218,13 @@ local function dispatch(cmd)
 end
 
 -- ===========================================================================
---  sync loop  (FREE only — paid never polls)
+--  receive: WebSocket push (preferred) + HTTP polling fallback   (FREE only)
+--  A persistent socket means commands are PUSHED instantly, so the executor
+--  makes no periodic HTTP calls — that is what removes the per-poll game freeze.
 -- ===========================================================================
-local running = false
+local active = false
+local wsSock = nil
+
 local function syncOnce()
     local ok, res = httpJson("POST", cfg.backendUrl .. "/api/sync", nil, selfIdentity())
     if ok and type(res) == "table" and type(res.commands) == "table" then
@@ -228,15 +232,65 @@ local function syncOnce()
     end
 end
 
-local function startLoop()
-    if running then return end
-    running = true
+local pollingStarted = false
+local function startPolling()
+    if pollingStarted then return end
+    pollingStarted = true
     task.spawn(function()
-        while running do
-            pcall(syncOnce)
+        while active do
+            if not wsSock then pcall(syncOnce) end   -- only polls while the socket is down
             task.wait(cfg.syncInterval)
         end
+        pollingStarted = false
     end)
+end
+
+local function resolveWSConnect()
+    local g = (getgenv and getgenv()) or {}
+    local WS = rawget(g, "WebSocket") or WebSocket
+    if type(WS) == "table" then
+        if type(WS.connect) == "function" then return WS.connect end
+        if type(WS.Connect) == "function" then return WS.Connect end
+    end
+    if syn and syn.websocket and type(syn.websocket.connect) == "function" then return syn.websocket.connect end
+    return nil
+end
+
+local connectWS
+connectWS = function()
+    local connect = resolveWSConnect()
+    if not connect then return false end
+    local wsUrl = cfg.backendUrl:gsub("^http", "ws") .. "/ws"   -- https->wss, http->ws
+    local ok, sock = pcall(connect, wsUrl)
+    if not ok or not sock then return false end
+    wsSock = sock
+
+    local hello = selfIdentity(); hello.type = "hello"
+    pcall(function() sock:Send(HttpService:JSONEncode(hello)) end)
+
+    local onMsg = sock.OnMessage or sock.onMessage
+    if onMsg and onMsg.Connect then
+        onMsg:Connect(function(raw)
+            local okD, cmd = pcall(function() return HttpService:JSONDecode(raw) end)
+            if okD then dispatch(cmd) end
+        end)
+    end
+
+    local onClose = sock.OnClose or sock.onClose
+    if onClose and onClose.Connect then
+        onClose:Connect(function()
+            if wsSock == sock then wsSock = nil end
+            if active then task.delay(5, function() if active and not wsSock then connectWS() end end) end
+        end)
+    end
+
+    task.spawn(function()   -- keepalive so idle proxies don't drop the socket
+        while active and wsSock == sock do
+            task.wait(25)
+            if wsSock == sock then pcall(function() sock:Send('{"type":"hb"}') end) end
+        end
+    end)
+    return true
 end
 
 -- ===========================================================================
@@ -278,12 +332,18 @@ function OxyNet.start(opts)
     cfg.onCommand    = opts.onCommand
 
     shared.OxyNet = OxyNet
-    if cfg.tier == "free" then startLoop() end   -- paid stays silent (no polling)
+    if cfg.tier == "free" then
+        active = true
+        pcall(connectWS)   -- opens a push socket if the executor supports WebSocket
+        startPolling()     -- permanent fallback: only actually polls while the socket is down
+    end
+    -- paid stays silent: no socket, no polling (getTargets/sendCommand are on-demand)
     return OxyNet
 end
 
 function OxyNet.stop()
-    running = false
+    active = false
+    if wsSock then pcall(function() wsSock:Close() end); wsSock = nil end
     pcall(EXEC.unfreeze)
 end
 
